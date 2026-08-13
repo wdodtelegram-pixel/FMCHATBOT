@@ -1,0 +1,4 @@
+python-dotenv
+openpyxl
+python-telegram-bot
+requests
