@@ -1,3 +1,12 @@
+"""
+config.py
+=========
+PURPOSE
+    One single place to change anything that is "settings" rather than "logic".
+    Nothing in this file does work -- it only declares constants that the rest
+    of the bot imports. If you rename an Excel column, add a 6th job category,
+    or move the workbook, this is the ONLY file you should need to edit.
+"""
 
 import os
 import re
@@ -193,6 +202,42 @@ SHEET_NAME = _env("SHEET_NAME", "Jobs")
 # Leave blank to use the local synced file only.
 ONEDRIVE_SHARE_LINK = _env("ONEDRIVE_SHARE_LINK")
 
+# ---------------------------------------------------------------------------
+# 2b. Data source selector  (Option C: Google Form -> published CSV)
+# ---------------------------------------------------------------------------
+# PURPOSE: choose WHERE job data comes from without touching any other file.
+#
+#   "excel"       (default) -> read the local .xlsx workbook, as before.
+#   "google_csv"  -> fetch a Google Sheet that has been "Published to web"
+#                    as CSV. This is how Option C works with NO Google Cloud
+#                    account: the sheet is served as a plain public URL and the
+#                    bot just downloads it over HTTP.
+DATA_SOURCE = _env("DATA_SOURCE", "excel").lower()
+
+# The "Publish to web" CSV link for your Google Form's response sheet.
+# Looks like:
+#   https://docs.google.com/spreadsheets/d/e/2PACX-.../pub?gid=0&single=true&output=csv
+# Only used when DATA_SOURCE = "google_csv".
+GOOGLE_CSV_URL = _env("GOOGLE_CSV_URL")
+
+# Google Forms is APPEND-ONLY: every submission adds a new row, it never edits
+# an old one. So to "update" a job the officer resubmits the form with the same
+# Job ID, and the bot keeps only the NEWEST row per Job ID. Set to false to show
+# every raw submission instead.
+DEDUPE_BY_JOB_ID = _env("DEDUPE_BY_JOB_ID", "true").lower() in ("1", "true", "yes", "on")
+
+# The automatic column Google Forms adds to every response sheet. Used to work
+# out which submission is newest. In non-English locales this header may differ;
+# change it here if your sheet calls it something else.
+FORM_TIMESTAMP_COLUMN = _env("FORM_TIMESTAMP_COLUMN", "Timestamp")
+
+# How the Form timestamp is written. Singapore/UK forms use day-first
+# (DD/MM/YYYY); US forms use month-first. Only affects tie-breaking of updates.
+FORM_TIMESTAMP_DAYFIRST = _env("FORM_TIMESTAMP_DAYFIRST", "true").lower() in ("1", "true", "yes", "on")
+
+# FORM_COLUMN_MAP is defined further down, AFTER the column-name constants it
+# refers to (see section 3b).
+
 # How often (seconds) the background refresh job re-reads the workbook.
 # The loader ALSO checks the file timestamp on every command, so this is really
 # just a safety net that keeps the cache warm.
@@ -229,6 +274,21 @@ REQUIRED_COLUMNS = [
     COL_EST_COMPLETION,
     COL_NEXT_JOB,
 ]
+
+# ---------------------------------------------------------------------------
+# 3b. Google Form question -> column mapping  (Option C only)
+# ---------------------------------------------------------------------------
+# PURPOSE: map your Google Form QUESTION TITLES to the column names above.
+# Defined here, after the COL_* constants, so you can reference them.
+#
+# Leave this EMPTY if you name the form questions exactly like the columns
+# (recommended -- the setup guide tells you to do this). Only fill it in if you
+# want friendlier question wording on the form. Example:
+#     FORM_COLUMN_MAP = {
+#         "Which job ID?": COL_JOB_ID,
+#         "What type of maintenance?": COL_TYPE,
+#     }
+FORM_COLUMN_MAP: dict = {}
 
 # ---------------------------------------------------------------------------
 # 4. The job categories

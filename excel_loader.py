@@ -1,176 +1,31 @@
+"""
+excel_loader.py
+===============
+PURPOSE
+    This is the "Load Latest Excel Workbook -> Convert Excel into Pandas
+    DataFrame" stage of your processing workflow. It is deliberately separated
+    from the Telegram code so that the bot layer never touches pandas directly.
 
+    Three jobs:
+      1. Read maintenance_jobs.xlsx into a DataFrame.
+      2. Cache it, and automatically re-read whenever the file changes on disk
+         (which is what happens seconds after the FM Officer saves in Excel
+         Online and OneDrive syncs the change down).
+      3. Clean the data -- strip stray spaces, normalise Status/Type spellings,
+         drop empty rows -- so the rest of the bot can trust what it gets.
+"""
 
 from __future__ import annotations
 
 import logging
-import math
 import threading
-from collections import Counter
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+
+import pandas as pd
 
 import config
 
-try:
-    import pandas as pd
-except ImportError:  # pragma: no cover
-    pd = None
-
 logger = logging.getLogger(__name__)
-
-
-def _is_missing(value: Any) -> bool:
-    return value is None or (isinstance(value, float) and math.isnan(value))
-
-
-class _StringAccessor:
-    def __init__(self, series: "SimpleSeries"):
-        self._series = series
-
-    def strip(self) -> "SimpleSeries":
-        return SimpleSeries(
-            [
-                value.strip()
-                if isinstance(value, str)
-                else str(value).strip()
-                if value is not None
-                else ""
-                for value in self._series.values
-            ],
-            name=self._series.name,
-        )
-
-    def lower(self) -> "SimpleSeries":
-        return SimpleSeries(
-            [
-                value.lower()
-                if isinstance(value, str)
-                else str(value).lower()
-                if value is not None
-                else ""
-                for value in self._series.values
-            ],
-            name=self._series.name,
-        )
-
-
-class _SimpleValueCounts(dict):
-    def to_dict(self) -> dict[Any, int]:
-        return dict(self)
-
-
-class SimpleSeries:
-    def __init__(self, values: list[Any], name: str | None = None):
-        self.values = list(values)
-        self.name = name
-
-    def astype(self, dtype: Any) -> "SimpleSeries":
-        if dtype is str:
-            return SimpleSeries(
-                ["" if value is None else str(value) for value in self.values],
-                name=self.name,
-            )
-        raise NotImplementedError(f"astype({dtype}) is not supported")
-
-    @property
-    def str(self) -> _StringAccessor:
-        return _StringAccessor(self)
-
-    def notna(self) -> list[bool]:
-        return [not _is_missing(value) for value in self.values]
-
-    def map(self, func: Any) -> "SimpleSeries":
-        return SimpleSeries([func(value) for value in self.values], name=self.name)
-
-    def value_counts(self) -> _SimpleValueCounts:
-        return _SimpleValueCounts(Counter(self.values))
-
-    def __eq__(self, other: Any) -> list[bool]:
-        return [value == other for value in self.values]
-
-    def __ne__(self, other: Any) -> list[bool]:
-        return [value != other for value in self.values]
-
-    def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, list):
-            if all(isinstance(item, bool) for item in key):
-                return SimpleSeries(
-                    [value for value, keep in zip(self.values, key) if keep],
-                    name=self.name,
-                )
-            return SimpleSeries([self.values[index] for index in key], name=self.name)
-        return self.values[key]
-
-    def __iter__(self):
-        return iter(self.values)
-
-    def __len__(self) -> int:
-        return len(self.values)
-
-    def __repr__(self) -> str:
-        return f"SimpleSeries(name={self.name!r}, values={self.values!r})"
-
-
-class SimpleDataFrame:
-    def __init__(self, rows: list[dict[str, Any]], columns: list[str] | None = None):
-        self._rows = [dict(row) for row in rows]
-        self.columns = list(columns) if columns is not None else list(rows[0].keys()) if rows else []
-
-    def __len__(self) -> int:
-        return len(self._rows)
-
-    @property
-    def empty(self) -> bool:
-        return len(self._rows) == 0
-
-    def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, str):
-            return SimpleSeries([row.get(key) for row in self._rows], name=key)
-        if isinstance(key, list):
-            if len(key) == len(self._rows) and all(isinstance(item, bool) for item in key):
-                return SimpleDataFrame([row.copy() for row, keep in zip(self._rows, key) if keep], columns=self.columns)
-            return SimpleDataFrame([self._rows[index].copy() for index in key], columns=self.columns)
-        raise TypeError("Unsupported DataFrame key type")
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if isinstance(value, SimpleSeries):
-            if len(value) != len(self._rows):
-                raise ValueError("Length of values does not match number of rows")
-            if key not in self.columns:
-                self.columns.append(key)
-            for row, item in zip(self._rows, value.values):
-                row[key] = item
-        elif isinstance(value, list):
-            if len(value) != len(self._rows):
-                raise ValueError("Length of values does not match number of rows")
-            if key not in self.columns:
-                self.columns.append(key)
-            for row, item in zip(self._rows, value):
-                row[key] = item
-        else:
-            if key not in self.columns:
-                self.columns.append(key)
-            for row in self._rows:
-                row[key] = value
-
-    def copy(self) -> "SimpleDataFrame":
-        return SimpleDataFrame([row.copy() for row in self._rows], columns=self.columns.copy())
-
-    def iterrows(self):
-        return enumerate(self._rows)
-
-    def sort_values(self, key: str, ascending: bool = True) -> "SimpleDataFrame":
-        sorted_rows = sorted(
-            self._rows,
-            key=lambda row: (row.get(key) is None, row.get(key)),
-            reverse=not ascending,
-        )
-        return SimpleDataFrame([row.copy() for row in sorted_rows], columns=self.columns.copy())
-
-    def __repr__(self) -> str:
-        return f"SimpleDataFrame(rows={len(self._rows)}, columns={self.columns!r})"
-
 
 # ---------------------------------------------------------------------------
 # Module-level cache
@@ -180,7 +35,7 @@ class SimpleDataFrame:
 # together with the file's modification time. A lock is used because
 # python-telegram-bot can process several updates concurrently, and two threads
 # rebuilding the cache at once would be wasteful.
-_cache_df: Any | None = None
+_cache_df: pd.DataFrame | None = None
 _cache_mtime: float | None = None
 _lock = threading.Lock()
 
@@ -222,7 +77,7 @@ def _download_from_onedrive(destination: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-def _clean(df: Any) -> Any:
+def _clean(df: pd.DataFrame) -> pd.DataFrame:
     """
     PURPOSE: turn a messy human-maintained spreadsheet into predictable data.
 
@@ -230,55 +85,183 @@ def _clean(df: Any) -> Any:
     values typed as "in progress", "In Progress " and "ONGOING". Fixing that
     here means every downstream function can do a plain equality check.
     """
+    # Strip whitespace from the header row -- "Status " is a very common typo
+    # and would otherwise make the column impossible to find.
     df.columns = [str(c).strip() for c in df.columns]
 
+    # Warn loudly if the sheet is missing something the bot needs, rather than
+    # crashing later with an obscure KeyError.
     missing = [c for c in config.REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         logger.warning("Workbook is missing expected column(s): %s", missing)
         for col in missing:
             df[col] = ""
 
+    # Drop rows where the Category cell is blank -- these are usually spacing
+    # rows or notes the FM Officer left at the bottom of the sheet.
     df = df[df[config.COL_CATEGORY].notna()].copy()
 
+    # Trim whitespace on every text cell.
+    # NOTE: do NOT test `df[col].dtype == object` here. In pandas 2.x text
+    # columns are object dtype, but in pandas 3.0 they load as the new "str"
+    # dtype, so that test silently becomes False and no stripping happens.
+    # Checking isinstance(v, str) per value works identically on both versions.
     for col in df.columns:
-        df[col] = [
-            value.strip() if isinstance(value, str) else value
-            for value in df[col]
-        ]
+        if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_datetime64_any_dtype(df[col]):
+            continue
+        df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else v)
 
-    def _normalize_status(value: Any) -> str:
-        if not _is_missing(value):
-            cleaned = str(value).strip()
-            return config.STATUS_CANONICAL.get(cleaned.lower(), cleaned)
-        return "Yet to Start"
+    # Normalise Status to one of the three canonical values.
+    df[config.COL_STATUS] = df[config.COL_STATUS].apply(
+        lambda v: config.STATUS_CANONICAL.get(str(v).strip().lower(), str(v).strip())
+        if pd.notna(v) else "Yet to Start"
+    )
 
-    def _normalize_type(value: Any) -> str:
-        if not _is_missing(value):
-            cleaned = str(value).strip()
-            return config.TYPE_CANONICAL.get(cleaned.lower(), cleaned)
-        return "-"
-
-    df[config.COL_STATUS] = [_normalize_status(value) for value in df[config.COL_STATUS]]
-    df[config.COL_TYPE] = [_normalize_type(value) for value in df[config.COL_TYPE]]
+    # Normalise Maintenance Type to Preventive / Corrective.
+    df[config.COL_TYPE] = df[config.COL_TYPE].apply(
+        lambda v: config.TYPE_CANONICAL.get(str(v).strip().lower(), str(v).strip())
+        if pd.notna(v) else "-"
+    )
 
     return df
 
 
 # ---------------------------------------------------------------------------
-def load_jobs(force: bool = False) -> Any:
-    """
-    PURPOSE: the main entry point used by every command handler.
+# ---------------------------------------------------------------------------
+# CSV cache (separate from the Excel mtime cache)
+# ---------------------------------------------------------------------------
+# PURPOSE: a published CSV URL has no file modification time we can stat, so we
+# cannot use the mtime trick. Instead we time-box the cache: re-fetch only when
+# the cached copy is older than REFRESH_INTERVAL_SECONDS, or when force=True.
+_csv_cache_df: pd.DataFrame | None = None
+_csv_cache_time: float = 0.0
 
-    Logic:
-      * If a OneDrive link is configured, refresh the local copy first.
-      * Compare the file's modification time against the cached one.
-      * Only re-read the workbook when the file actually changed (or when
-        force=True, used by the /refresh command and the background job).
 
-    This is what makes the bot "real-time": the officer saves in Excel Online,
-    OneDrive syncs the file, the mtime changes, and the very next Telegram
-    command sees the new data.
+def _rename_form_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
+    PURPOSE: apply config.FORM_COLUMN_MAP so friendly Google Form question
+    titles become the column names the rest of the bot expects.
+
+    Harmless when the map is empty (the recommended setup), in which case the
+    form questions are already named exactly like the columns.
+    """
+    if config.FORM_COLUMN_MAP:
+        df = df.rename(columns=config.FORM_COLUMN_MAP)
+    return df
+
+
+def _dedupe_newest(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    PURPOSE: collapse an append-only Form response sheet down to one row per
+    Job ID -- the newest submission wins.
+
+    Google Forms never edits a row, so updating a job means submitting again
+    with the same Job ID. Without this step the bot would show both the old
+    and new state of every job that was ever updated.
+
+    Newest is decided by the Form's Timestamp column. If that column is missing
+    or unparseable, we fall back to row order (later row = newer), which is how
+    Forms appends anyway.
+    """
+    if not config.DEDUPE_BY_JOB_ID or config.COL_JOB_ID not in df.columns:
+        return df
+
+    df = df.copy()
+
+    # Separate rows that actually have a Job ID from any blank ones, so blanks
+    # are never merged together by drop_duplicates.
+    has_id = df[config.COL_JOB_ID].astype(str).str.strip().ne("")
+    with_id = df[has_id]
+    without_id = df[~has_id]
+
+    ts_col = config.FORM_TIMESTAMP_COLUMN
+    if ts_col in with_id.columns:
+        parsed = pd.to_datetime(
+            with_id[ts_col], dayfirst=config.FORM_TIMESTAMP_DAYFIRST, errors="coerce"
+        )
+        with_id = with_id.assign(_ts=parsed)
+        # na_position="last" keeps rows with a real timestamp ahead of any that
+        # failed to parse, so a valid submission always beats an unparseable one.
+        with_id = with_id.sort_values("_ts", ascending=False, na_position="last")
+        with_id = with_id.drop_duplicates(subset=[config.COL_JOB_ID], keep="first")
+        with_id = with_id.drop(columns="_ts")
+    else:
+        # No timestamp column -> trust append order, last occurrence is newest.
+        with_id = with_id.drop_duplicates(subset=[config.COL_JOB_ID], keep="last")
+
+    return pd.concat([with_id, without_id], ignore_index=True)
+
+
+def _load_from_csv(force: bool = False) -> pd.DataFrame:
+    """
+    PURPOSE: Option C. Fetch the published-to-web Google Sheet as CSV over plain
+    HTTP, dedupe to newest-per-Job-ID, then run the same cleaning as Excel.
+
+    No Google Cloud, no credentials -- the sheet is a public URL. See
+    GOOGLE_FORM_SETUP.md for how to produce that URL.
+    """
+    global _csv_cache_df, _csv_cache_time
+
+    import io
+    import time
+
+    import requests
+
+    if not config.GOOGLE_CSV_URL:
+        raise ValueError(
+            "DATA_SOURCE is 'google_csv' but GOOGLE_CSV_URL is not set.\n"
+            "Add the published CSV link to your .env file. "
+            "See GOOGLE_FORM_SETUP.md."
+        )
+
+    now = time.monotonic()
+
+    with _lock:
+        # Time-boxed cache: reuse if fetched recently and not forced.
+        if (
+            not force
+            and _csv_cache_df is not None
+            and (now - _csv_cache_time) < config.REFRESH_INTERVAL_SECONDS
+        ):
+            return _csv_cache_df
+
+        logger.info("Fetching CSV from published Google Sheet...")
+        try:
+            resp = requests.get(config.GOOGLE_CSV_URL, timeout=20)
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            # If we have a stale cache, prefer serving it over crashing.
+            if _csv_cache_df is not None:
+                logger.warning("CSV fetch failed (%s); serving cached copy.", exc)
+                return _csv_cache_df
+            raise ConnectionError(
+                f"Could not fetch the Google CSV: {exc}\n"
+                "Check GOOGLE_CSV_URL and that the sheet is still published."
+            ) from exc
+
+        # Google serves the CSV as UTF-8. Guard against an HTML error page being
+        # returned instead of CSV (happens if the publish link was revoked).
+        text = resp.text
+        if text.lstrip().lower().startswith("<!doctype html") or "<html" in text[:200].lower():
+            raise ValueError(
+                "The URL returned a web page, not CSV data.\n"
+                "Re-check that the sheet is Published to web as CSV, and that "
+                "GOOGLE_CSV_URL ends with 'output=csv'."
+            )
+
+        df = pd.read_csv(io.StringIO(text))
+        df = _rename_form_columns(df)
+        df = _dedupe_newest(df)
+        df = _clean(df)
+
+        _csv_cache_df = df
+        _csv_cache_time = now
+        logger.info("CSV loaded: %d job row(s) after dedupe.", len(df))
+        return df
+
+
+def _load_from_excel(force: bool = False) -> pd.DataFrame:
+    """PURPOSE: the original Excel path, unchanged, now behind the source switch."""
     global _cache_df, _cache_mtime
 
     path = config.EXCEL_PATH
@@ -300,35 +283,7 @@ def load_jobs(force: bool = False) -> Any:
             return _cache_df
 
         logger.info("Reading workbook from disk: %s", path)
-        if pd is not None:
-            df = pd.read_excel(path, sheet_name=config.SHEET_NAME, engine="openpyxl")
-        else:
-            from openpyxl import load_workbook
-
-            workbook = load_workbook(path, data_only=True, read_only=True)
-            if config.SHEET_NAME not in workbook.sheetnames:
-                raise ValueError(
-                    f"Worksheet '{config.SHEET_NAME}' not found in workbook. "
-                    f"Available sheets: {', '.join(workbook.sheetnames)}"
-                )
-            sheet = workbook[config.SHEET_NAME]
-            rows = list(sheet.iter_rows(values_only=True))
-            if not rows:
-                raise ValueError("Workbook does not contain any rows")
-
-            headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
-            data_rows = []
-            for row in rows[1:]:
-                if row is None:
-                    continue
-                data_rows.append(
-                    {
-                        headers[index]: row[index]
-                        for index in range(min(len(headers), len(row)))
-                    }
-                )
-            df = SimpleDataFrame(data_rows, columns=headers)
-
+        df = pd.read_excel(path, sheet_name=config.SHEET_NAME, engine="openpyxl")
         df = _clean(df)
 
         _cache_df = df
@@ -336,8 +291,24 @@ def load_jobs(force: bool = False) -> Any:
         return df
 
 
+def load_jobs(force: bool = False) -> pd.DataFrame:
+    """
+    PURPOSE: the main entry point used by every command handler.
+
+    Routes to the configured data source:
+      * "excel"      -> read the local .xlsx workbook (default).
+      * "google_csv" -> fetch a published Google Form response sheet as CSV.
+
+    Every other function (get_jobs_for_category, get_summary_counts) calls this,
+    so switching DATA_SOURCE changes the whole bot with no other code edits.
+    """
+    if config.DATA_SOURCE == "google_csv":
+        return _load_from_csv(force)
+    return _load_from_excel(force)
+
+
 # ---------------------------------------------------------------------------
-def get_jobs_for_category(category_key: str) -> Any:
+def get_jobs_for_category(category_key: str) -> pd.DataFrame:
     """
     PURPOSE: the "Search DataFrame" stage of your workflow.
 
