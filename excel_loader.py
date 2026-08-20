@@ -18,6 +18,7 @@ PURPOSE
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from pathlib import Path
 
@@ -137,16 +138,48 @@ _csv_cache_df: pd.DataFrame | None = None
 _csv_cache_time: float = 0.0
 
 
+def _strip_form_instructions(header: str) -> str:
+    """
+    PURPOSE: Google Forms question titles often carry example/instruction text
+    in parentheses or brackets, e.g. "Job ID (e.g ACMV-001)" or
+    "Estimated Completion (Type: Week 1 January 2026 [week-month-year])".
+
+    That extra text is what breaks an exact match against
+    config.REQUIRED_COLUMNS even though the underlying question IS the right
+    one. Cutting the header at the first "(" or "[" recovers the plain
+    column name the FM Officer sees on the form.
+    """
+    return re.split(r"[\(\[]", str(header), maxsplit=1)[0].strip()
+
+
 def _rename_form_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
-    PURPOSE: apply config.FORM_COLUMN_MAP so friendly Google Form question
-    titles become the column names the rest of the bot expects.
+    PURPOSE: turn Google Form question titles into the column names the rest
+    of the bot expects.
 
-    Harmless when the map is empty (the recommended setup), in which case the
-    form questions are already named exactly like the columns.
+    Two mechanisms, both optional and safe to combine:
+      1. config.FORM_COLUMN_MAP -- an explicit, exact-text override for when
+         the officer wants completely different wording on the form.
+      2. Automatic instruction-stripping -- handles the common case where the
+         question title IS the column name plus some parenthetical/bracketed
+         hint text for whoever is filling in the form. This keeps working
+         even if that hint text is edited later, so it is tried first and
+         FORM_COLUMN_MAP can still override anything it doesn't catch.
     """
     if config.FORM_COLUMN_MAP:
         df = df.rename(columns=config.FORM_COLUMN_MAP)
+
+    expected_by_normalized = {c.lower(): c for c in config.REQUIRED_COLUMNS}
+    rename_map = {}
+    for col in df.columns:
+        if col in config.REQUIRED_COLUMNS:
+            continue
+        target = expected_by_normalized.get(_strip_form_instructions(col).lower())
+        if target and target not in df.columns:
+            rename_map[col] = target
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
     return df
 
 
